@@ -1,19 +1,40 @@
 #include "Minitel.h"
 
-// ---- C0 / control codes ----------------------------------------------------
+// ---- C0 / control codes (Readability improvements) --------------------------
 static const uint8_t C_NUL = 0x00;
 static const uint8_t C_BS  = 0x08;
-static const uint8_t C_HT  = 0x09;
+static const uint8_t C_HT  = 0x09; // Horizontal Tab
 static const uint8_t C_LF  = 0x0A;
+static const uint8_t C_VT  = 0x0B; // Vertical Tab
 static const uint8_t C_FF  = 0x0C; // clear screen
 static const uint8_t C_CR  = 0x0D;
 static const uint8_t C_SO  = 0x0E; // shift-out  (G1)
 static const uint8_t C_SI  = 0x0F; // shift-in   (G0)
 static const uint8_t C_SEP = 0x13; // SEP
 static const uint8_t C_REP = 0x12; // REP
+static const uint8_t C_ESC = 0x1B; // ESC
+static const uint8_t C_CAN = 0x18; // CANCEL (Clear Line)
 static const uint8_t C_RS  = 0x1E; // home
 static const uint8_t C_US  = 0x1F; // cursor position
-static const uint8_t C_ESC = 0x1B; // ESC
+static const uint8_t C_DEL = 0x7F; // DELETE
+
+// ---- STUM M1 SEP codes (Second Byte - Readability improvements) -------------
+static const uint8_t SEP_SEND_KEY      = 0x41; // 4/1
+static const uint8_t SEP_PREVIOUS_KEY  = 0x42; // 4/2
+static const uint8_t SEP_REPEAT_KEY    = 0x43; // 4/3
+static const uint8_t SEP_GUIDE_KEY     = 0x44; // 4/4
+static const uint8_t SEP_CANCEL_KEY    = 0x45; // 4/5
+static const uint8_t SEP_INDEX_KEY     = 0x46; // 4/6
+static const uint8_t SEP_ERASE_KEY     = 0x47; // 4/7
+static const uint8_t SEP_NEXT_KEY      = 0x48; // 4/8
+static const uint8_t SEP_CONNECT_KEY   = 0x49; // 4/9
+static const uint8_t SEP_ECP_ACT_REQ   = 0x4A; // 4/10
+static const uint8_t SEP_ECP_INH_REQ   = 0x4B; // 4/11
+static const uint8_t SEP_MOD_INV_REQ   = 0x4C; // 4/12
+static const uint8_t SEP_ENVOI_KEY     = 0x4D; // 4/13 (Modem return to normal req, used as Enter/Send)
+
+static const uint8_t SEP_STATUS_CS     = 0x50; // 5/0 (Connection Status)
+static const uint8_t SEP_STATUS_PT     = 0x54; // 5/4 (PT status change)
 
 // ---- STUM module transmission / reception codes ----------------------------
 static const uint8_t MOD_SCREEN_TX   = 0x50; // 5/0
@@ -23,48 +44,35 @@ static const uint8_t MOD_SOCKET_TX   = 0x53; // 5/3
 
 static const uint8_t MOD_SCREEN_RX   = 0x58; // 5/8
 static const uint8_t MOD_KEYBOARD_RX = 0x59; // 5/9
-static const uint8_t MOD_MODEM_RX    = 0x5A; // 5/A
-static const uint8_t MOD_SOCKET_RX   = 0x5B; // 5/B
+static const uint8_t MOD_MODEM_RX    = 0x5A; // 5/10
+static const uint8_t MOD_SOCKET_RX   = 0x5B; // 5/11
 
-// PRO3 control codes
-static const uint8_t PRO3_CTRL_OFF   = 0x60; // 6/0
 static const uint8_t PRO3_CTRL_ON    = 0x61; // 6/1
+static const uint8_t PRO3_CTRL_OFF   = 0x60; // 6/0
 
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// Constructor / Setup
 // ----------------------------------------------------------------------------
 
 Minitel::Minitel() {
-    tx_.active     = false;
-    tx_.waitSep    = false;
-    tx_.timeoutMs  = 0;
-    tx_.startMs    = 0;
-    tx_.onSuccess  = nullptr;
-    tx_.onTimeout  = nullptr;
-    tx_.userData   = nullptr;
+    memset(eventBuf_, 0, sizeof(eventBuf_));
 }
 
-// ----------------------------------------------------------------------------
-
-void Minitel::begin(Stream& s, int ptPin, int tpPin) {
-    io_    = &s;
+void Minitel::begin(Stream* stream, uint8_t ptPin, uint8_t tpPin, Stream* debug) {
+    stream_ = stream;
     ptPin_ = ptPin;
     tpPin_ = tpPin;
+    debug_ = debug;
 
-    if (ptPin_ >= 0) {
-        pinMode(ptPin_, INPUT); // hi-Z
+    if (ptPin_ != 255) {
+        pinMode(ptPin_, OUTPUT);
+        digitalWrite(ptPin_, LOW);
     }
-    if (tpPin_ >= 0) {
+    if (tpPin_ != 255) {
         pinMode(tpPin_, INPUT);
     }
-
-    sessionState_ = SessionState::Closed;
-    lastSessionEventMs_ = millis();
-    eventHead_ = eventTail_ = 0;
-
-    waitingSepSecond_ = false;
-    escState_ = ESC_IDLE;
-    escTmpLen_ = 0;
-
-    tx_.active = false;
 }
 
 // ----------------------------------------------------------------------------
@@ -242,84 +250,93 @@ void Minitel::handleEscByte(uint8_t c) {
         break;
     }
 }
+// ----------------------------------------------------------------------------
+// Internal Parsing and State Machines (handleLineEditingControl and parseByte modified)
+// ----------------------------------------------------------------------------
+
+bool Minitel::handleLineEditingControl(uint8_t c) {
+    // These controls are often used for local line editing (cursor movement, delete)
+    // and would complicate the simple Event FIFO. We consume them here.
+    switch (c) {
+        case C_HT:  // Horizontal Tab (Cursor Right)
+        case C_VT:  // Vertical Tab (Cursor Up)
+        case C_RS:  // Home Cursor (Cursor to 1/1)
+        case C_US:  // Cursor Position (Prefix)
+        case C_CAN: // Cancel/Clear Line
+        case C_DEL: // Delete (7F)
+            // A full implementation would update an internal buffer/echo the action,
+            // but for simplicity, we just consume the control code.
+            if (debug_) {
+                debug_->print(F("CONTROL 0x"));
+                debug_->print(c, HEX);
+                debug_->println(F(" consumed."));
+            }
+            return true; // Consume the byte
+        default:
+            return false; // Not a complex editing control
+    }
+}
 
 void Minitel::parseByte(uint8_t c) {
-    c &= 0x7F;
+    c &= 0x7F; // Strip parity bit (7-bit data)
 
-    if (debug_) {
-        debug_->print(F("RX "));
-        if (c < 0x10) debug_->print('0');
-        debug_->print(c, HEX);
-        debug_->print(' ');
-    }
-
-    // ESC state machine has priority
+    // 1. ESC sequence state machine takes priority
     if (escState_ != ESC_IDLE) {
         handleEscByte(c);
         return;
     }
 
-    // Waiting for SEP's second byte
+    // 2. SEP sequence
     if (waitingSepSecond_) {
-        waitingSepSecond_ = false;
         handleSep(c);
+        waitingSepSecond_ = false;
         return;
     }
 
-    // Start ESC sequence
+    // 3. Complex navigation/editing controls (Consumed)
+    if (handleLineEditingControl(c)) {
+        return;
+    }
+
+    // 4. Start ESC or SEP sequence
     if (c == C_ESC) {
-        escState_  = ESC_GOT_ESC;
-        escTmpLen_ = 0;
+        escState_ = ESC_GOT_ESC;
         return;
     }
-
-    // Start SEP sequence
     if (c == C_SEP) {
         waitingSepSecond_ = true;
         return;
     }
 
-    // Printable ASCII
-    if (c >= 0x20 && c <= 0x7E) {
-        Event ev;
-        ev.type   = Event::CHAR;
-        ev.code   = c;
-        ev.row    = 0;
-        ev.col    = 0;
-        ev.escLen = 0;
-        for (uint8_t i = 0; i < sizeof(ev.escData); ++i) ev.escData[i] = 0;
-        pushEvent(ev);
-        return;
-    }
-
-    // CR / LF / BS as CHAR events
+    // 5. Explicitly classified C0 Controls (CR, LF, BS must be Event::CHAR for readLine)
     if (c == C_CR || c == C_LF || c == C_BS) {
         Event ev;
-        ev.type   = Event::CHAR;
-        ev.code   = c;
-        ev.row    = 0;
-        ev.col    = 0;
-        ev.escLen = 0;
-        for (uint8_t i = 0; i < sizeof(ev.escData); ++i) ev.escData[i] = 0;
+        ev.type = Event::CHAR;
+        ev.code = c;
         pushEvent(ev);
         return;
     }
 
-    // Other C0 controls as CONTROL events
+    // 6. Other C0 Controls (0x00 to 0x1F, excluding the exceptions above)
     if (c < 0x20) {
+        // This captures NUL, BEL, FF, RS, US (which is consumed by handleLineEditingControl)
         Event ev;
-        ev.type   = Event::CONTROL;
-        ev.code   = c;
-        ev.row    = 0;
-        ev.col    = 0;
-        ev.escLen = 0;
-        for (uint8_t i = 0; i < sizeof(ev.escData); ++i) ev.escData[i] = 0;
+        ev.type = Event::CONTROL;
+        ev.code = c;
         pushEvent(ev);
         return;
     }
-
-    // Everything else ignored
+    
+    // 7. Printable Characters (G0/G1 Sets: 0x20 Space to 0x7E Tilde)
+    if (c >= 0x20 && c <= 0x7E) {
+        Event ev;
+        ev.type = Event::CHAR;
+        ev.code = c;
+        pushEvent(ev);
+        return;
+    }
 }
+
 
 // ----------------------------------------------------------------------------
 // Transaction helpers
@@ -378,41 +395,48 @@ void Minitel::checkTransactionTimeout() {
 }
 
 // ----------------------------------------------------------------------------
-// poll()
+// Core I/O and Polling (waitEvent modified)
 // ----------------------------------------------------------------------------
 
 void Minitel::poll() {
-    if (!io_) return;
+    if (!stream_) return;
 
-    while (io_->available() > 0) {
-        int r = io_->read();
-        if (r < 0) break;
-        parseByte((uint8_t)r);
+    while (stream_->available()) {
+        uint8_t c = stream_->read();
+        parseByte(c);
     }
 
-    checkTransactionTimeout();
+    // Check transaction timeout
+    if (tx_.active && tx_.timeoutMs > 0) {
+        if ((uint16_t)(millis() - tx_.startTime) > tx_.timeoutMs) {
+            if (debug_) debug_->println(F("TX Timeout"));
+            tx_.active = false;
+            tx_.success = false;
+        }
+    }
 }
-
-// ----------------------------------------------------------------------------
-// Blocking event helpers (used by readChar/readLine)
-// ----------------------------------------------------------------------------
 
 bool Minitel::waitEvent(Event& ev, uint16_t timeoutMs) {
     unsigned long start = millis();
 
     while (true) {
-        if (eventAvailable()) {
-            if (readEvent(ev)) return true;
+        // 1. Process new bytes
+        poll();
+
+        // 2. Check for events
+        if (eventAvailable() && readEvent(ev)) {
+            return true;
         }
 
+        // 3. Check for timeout
         if (timeoutMs > 0) {
+            // Note: Use (uint16_t) subtraction to handle overflow
             if ((uint16_t)(millis() - start) > timeoutMs) {
+                ev.type = Event::TIMEOUT;
                 return false;
             }
         }
-
-        poll();
-        delay(1); // be gentle
+        // NOTE: No delay(1) here for maximum efficiency at 1200 bauds.
     }
 }
 
@@ -432,87 +456,113 @@ bool Minitel::readChar(char& c, uint16_t timeoutMs) {
     return false;
 }
 
-bool Minitel::readLine(char* buf,
-                       size_t maxLen,
-                       uint16_t timeoutMs,
-                       bool stopOnEnvoi,
-                       bool echoLocally)
+bool Minitel::readLine(char* buf, size_t bufSize, bool echo,
+                       bool stopOnEnvoi, uint16_t timeoutMs)
 {
-    if (!buf || maxLen == 0) return false;
-
-    size_t idx = 0;
-    buf[0] = '\0';
-
     unsigned long start = millis();
-    Event ev;
+    size_t idx = 0;
+
+    if (bufSize == 0) return false;
+    bufSize--; // Reserve space for null terminator
 
     while (true) {
-        while (eventAvailable()) {
-            if (!readEvent(ev)) break;
-
-            if (ev.type == Event::CHAR) {
-                uint8_t c = ev.code;
-
-                // CR or LF ends line
-                if (c == C_CR || c == C_LF) {
-                    buf[idx] = '\0';
-                    return true;
-                }
-
-                // Backspace
-                if (c == C_BS) {
-                    if (idx > 0) {
-                        idx--;
-                        buf[idx] = '\0';
-                        if (echoLocally) {
-                            putChar('\b');
-                            putChar(' ');
-                            putChar('\b');
-                        }
-                    }
-                    continue;
-                }
-
-                // Printable
-                if (c >= 0x20 && c <= 0x7E) {
-                    if (idx < maxLen - 1) {
-                        buf[idx++] = (char)c;
-                        buf[idx]   = '\0';
-                        if (echoLocally) {
-                            putChar((char)c);
-                        }
-                    }
-                    continue;
-                }
-
-                // other controls ignored
-            }
-            else if (ev.type == Event::SEP) {
-                if (stopOnEnvoi && ev.row == 4 && ev.col == 13) {
-                    // ENVOI
-                    buf[idx] = '\0';
-                    return true;
-                }
-                // other SEP ignored
-            }
-            // ESCSEQ, CONTROL ignored in readLine
+        // Handle timeout for the entire line
+        if (timeoutMs > 0 && (uint16_t)(millis() - start) > timeoutMs) {
+            buf[idx] = '\0';
+            return false;
         }
 
-        if (timeoutMs > 0) {
-            if ((uint16_t)(millis() - start) > timeoutMs) {
+        Event ev;
+        // Use a small, repeated internal timeout to be responsive
+        if (!waitEvent(ev, 100)) continue; 
+
+        if (ev.type == Event::CHAR) {
+            uint8_t c = ev.code;
+
+            // Line Ending
+            if (c == C_CR || c == C_LF) {
+                if (echo) print("\r\n");
                 buf[idx] = '\0';
-                return false;
+                return true;
+            }
+
+            // Backspace
+            if (c == C_BS) {
+                if (idx > 0) {
+                    idx--;
+                    if (echo) print("\b \b"); // Backspace, Space, Backspace
+                }
+                continue;
+            }
+
+            // Printable characters
+            if (idx < bufSize && c >= 0x20 && c <= 0x7E) {
+                buf[idx++] = c;
+                if (echo) putChar(c);
+                continue;
             }
         }
-
-        poll();
-        delay(1);
+        else if (ev.type == Event::SEP) {
+            // Check for SEP 4/13 (ENVOI key)
+            if (stopOnEnvoi && ev.code == SEP_ENVOI_KEY) { 
+                if (echo) print("\r\n");
+                buf[idx] = '\0';
+                return true;
+            }
+        }
     }
 }
 
 // ----------------------------------------------------------------------------
 // Screen / text helpers
 // ----------------------------------------------------------------------------
+
+
+void Minitel::printOptimized(const char* s, size_t len) {
+    size_t i = 0;
+    // Maximum repetition count is 95, based on the max count character 0x7E - 0x1F
+    static const size_t MAX_REP_COUNT = 95;
+    // Minimum repetition length to save bytes (REP sequence is 3 bytes, so save for 4+)
+    static const size_t REP_THRESHOLD = 4; 
+
+    while (i < len) {
+        uint8_t current_char = (uint8_t)s[i];
+        size_t j = i;
+        
+        // Find the run length
+        while (j < len && (uint8_t)s[j] == current_char) {
+            j++;
+        }
+        size_t run_length = j - i;
+        
+        // Use C_REP sequence if run is long enough
+        if (run_length >= REP_THRESHOLD) {
+            size_t reps_to_send = run_length;
+            
+            // Handle runs longer than the maximum REP count
+            while (reps_to_send > 0) {
+                size_t current_reps = (reps_to_send > MAX_REP_COUNT) ? MAX_REP_COUNT : reps_to_send;
+
+                // Send C_REP sequence: [C_REP] [Count] [Char]
+                uint8_t count_byte = 0x1F + current_reps; // Count byte (0x20 for 1 rep, 0x7E for 95 reps)
+                
+                writeRaw(C_REP);
+                writeRaw(count_byte);
+                writeRaw(current_char);
+                
+                reps_to_send -= current_reps;
+            }
+            i = j; // Move index past the entire run
+        } else {
+            // Send characters raw (no repetition or too short run)
+            for (size_t k = 0; k < run_length; k++) {
+                writeRaw(current_char);
+            }
+            i = j; // Move index past the run
+        }
+    }
+}
+
 
 void Minitel::clearScreen() {
     writeRaw(C_FF);
@@ -537,22 +587,27 @@ void Minitel::setCursor(uint8_t row, uint8_t col) {
 }
 
 void Minitel::putChar(char c) {
+    // Optimization: Ensure G0 (alphanumeric) mode is active.
+    if (currentSet_ != CharSet::G0_ALPHA) {
+        writeRaw(C_SI); // SI (Shift In)
+        currentSet_ = CharSet::G0_ALPHA;
+    }
     writeRaw((uint8_t)c);
 }
 
-// ----- generic printing helpers ---------------------------------------------
-
 void Minitel::print(const char* s) {
-    if (!s) return;
-    while (*s) {
-        putChar(*s++);
+    // Optimization: Ensure G0 (alphanumeric) mode is active once.
+    if (currentSet_ != CharSet::G0_ALPHA) {
+        writeRaw(C_SI); // SI (Shift In)
+        currentSet_ = CharSet::G0_ALPHA;
     }
+    // Now call the C_REP optimized printer
+    printOptimized(s, strlen(s));
 }
 
 void Minitel::println(const char* s) {
     print(s);
-    putChar('\r');
-    putChar('\n');
+    print("\r\n");
 }
 
 void Minitel::println() {
@@ -593,29 +648,48 @@ void Minitel::print(unsigned long v, int base) {
 // ----------------------------------------------------------------------------
 // Semi-graphics
 // ----------------------------------------------------------------------------
-
 void Minitel::beginSemiGraphics() {
-    writeRaw(C_SO);
+    // Optimization: only send SO if the state is not already G1
+    if (currentSet_ != CharSet::G1_GRAPHIC) {
+        writeRaw(C_SO); // SO (Shift Out)
+        currentSet_ = CharSet::G1_GRAPHIC;
+    }
 }
 
 void Minitel::endSemiGraphics() {
-    writeRaw(C_SI);
+    // Optimization: only send SI if the state is not already G0
+    if (currentSet_ != CharSet::G0_ALPHA) {
+        writeRaw(C_SI); // SI (Shift In)
+        currentSet_ = CharSet::G0_ALPHA;
+    }
 }
 
 void Minitel::putSemiGraphic(uint8_t code) {
-    uint8_t c = code & 0x7F;
-    if (c < 0x20) c = 0x20;
-    if (c > 0x7E) c = 0x7E;
-    writeRaw(c);
+    // Optimization: uses beginSemiGraphics to handle state
+    beginSemiGraphics();
+    writeRaw(code & 0x7F); 
 }
 
+void Minitel::printSemiGraphics(const char* s) {
+    // Optimization: Ensure G1 (semi-graphic) mode is active once.
+    if (currentSet_ != CharSet::G1_GRAPHIC) {
+        writeRaw(C_SO); // SO (Shift Out)
+        currentSet_ = CharSet::G1_GRAPHIC;
+    }
+    // Now call the C_REP optimized printer
+    printOptimized(s, strlen(s));
+}
 void Minitel::putSemiGraphicAt(uint8_t row, uint8_t col, uint8_t code) {
+    // Optimized: Set cursor, switch set *once*, print, and switch back (if needed)
     setCursor(row, col);
+    
+    // Switch to G1
     beginSemiGraphics();
-    putSemiGraphic(code);
+    writeRaw(code & 0x7F);
+    
+    // Switch back to G0 for safety/next print job
     endSemiGraphics();
 }
-
 // ----------------------------------------------------------------------------
 // PRO3: keyboard/screen switching
 // ----------------------------------------------------------------------------

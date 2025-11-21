@@ -9,10 +9,10 @@
  *
  * - Uses a generic Stream (HardwareSerial recommended: 1200 bauds, SERIAL_7E1).
  * - Provides:
- *   - Unified event stream (chars, SEP, ESC sequences, controls).
- *   - Simple async "transaction" system (C-style callbacks).
- *   - Screen helpers: clear, cursor, text, semi-graphics.
- *   - Keyboard helpers: readChar, readLine.
+ * - Unified event stream (chars, SEP, ESC sequences, controls).
+ * - Simple async "transaction" system (C-style callbacks).
+ * - Screen helpers: clear, cursor, text, semi-graphics.
+ * - Keyboard helpers: readChar, readLine.
  *
  * Designed for Arduino Mega 2560 + Serial1, but works with any Stream.
  */
@@ -33,328 +33,252 @@ public:
         uint8_t code;     ///< CHAR: character; SEP: second byte; ESCSEQ: opcode (e.g. 0x3B)
         uint8_t row;      ///< SEP row (for type == SEP)
         uint8_t col;      ///< SEP col (for type == SEP)
-
-        uint8_t escLen;          ///< For ESCSEQ: number of data bytes
-        uint8_t escData[4];      ///< For ESCSEQ: payload (e.g. 3 bytes for PRO3)
+        uint8_t escLen;   ///< ESCSEQ: length of escData
+        uint8_t escData[4]; ///< ESCSEQ: sequence payload (max 4 bytes)
     };
-
-    // ---------------------------------------------------------------------
-    // Session state (power / PT line)
-    // ---------------------------------------------------------------------
-    enum class SessionState : uint8_t {
-        Closed,
-        Opening,
-        Open,
-        Closing
-    };
-
-    // ---------------------------------------------------------------------
-    // Transaction structure (simple async engine)
-    //
-    // Typical use:
-    //  - Begin transaction waiting for a specific SEP row/col, with timeout.
-    //  - Poll regularly; when SEP seen or timeout, callback is invoked.
-    // ---------------------------------------------------------------------
-    struct Transaction {
-        bool     active         = false;
-        bool     waitSep        = false;
-        uint8_t  sepRow         = 0;
-        uint8_t  sepCol         = 0;
-        uint16_t timeoutMs      = 0;
-        unsigned long startMs   = 0;
-
-        void (*onSuccess)(void*) = nullptr;  ///< Called when condition is met
-        void (*onTimeout)(void*) = nullptr;  ///< Called when timeout is reached
-        void* userData           = nullptr;  ///< Opaque user pointer passed to callbacks
-    };
-
-    // ---------------------------------------------------------------------
-    // Ctor / setup
-    // ---------------------------------------------------------------------
 
     /**
-     * Default constructor.
-     * Call begin() before using the instance.
+     * Internal state of the Minitel session (PT line).
      */
+    enum class SessionState : uint8_t {
+        Closed,  ///< PT is released, session is off.
+        Opening, ///< PT asserted, waiting for 5/4 ack.
+        Open     ///< Session is open (Minitel ready to receive/send).
+    };
+
+    /**
+     * Minitel transaction structure.
+     */
+    struct Transaction {
+        bool active = false;          ///< true if transaction is running
+        uint8_t sepRow = 0;           ///< expected SEP row (4 or 5)
+        uint8_t sepCol = 0;           ///< expected SEP col (0 to 15)
+        uint16_t timeoutMs = 0;       ///< timeout in ms
+        unsigned long startTime = 0;  ///< millis() when transaction started
+        bool success = false;         ///< result of transaction
+    };
+
+    // ---------------------------------------------------------------------
+    // Constructor / Setup
+    // ---------------------------------------------------------------------
     Minitel();
 
     /**
-     * Attach an already-configured stream (1200 bauds, SERIAL_7E1).
+     * Initialize the Minitel driver.
      *
-     * @param s      HardwareSerial / SoftwareSerial / any Stream.
-     * @param ptPin  Optional PT control pin (active LOW). -1 if not used.
-     * @param tpPin  Optional TP sense pin (reads terminal power). -1 if not used.
+     * @param stream  The Stream instance (e.g., &Serial1)
+     * @param ptPin   Arduino pin driving the PT line (e.g., 2). Set to 255 to disable.
+     * @param tpPin   Arduino pin reading the TP line (e.g., 3). Set to 255 to disable.
+     * @param debug   Optional Stream for debug output (e.g., &Serial).
      */
-    void begin(Stream& s, int ptPin = -1, int tpPin = -1);
-
-    /**
-     * Set optional debug stream (e.g. Serial).
-     * RX/TX bytes and parsed events can be logged here.
-     */
-    void setDebug(Stream* dbg) { debug_ = dbg; }
-
-    /**
-     * Main polling function.
-     * Call often from loop():
-     *  - Reads incoming bytes from Minitel.
-     *  - Parses C0/SEP/ESC sequences into Events.
-     *  - Pushes them to the internal FIFO.
-     *  - Updates the transaction engine (timeouts, SEP acks).
-     */
-    void poll();
+    void begin(Stream* stream, uint8_t ptPin = 255, uint8_t tpPin = 255, Stream* debug = nullptr);
 
     // ---------------------------------------------------------------------
-    // Basic session & power
+    // Session Management (PT/TP)
     // ---------------------------------------------------------------------
 
     /**
-     * Start a Minitel session:
-     *  - pulls PT low (if ptPin configured),
-     *  - moves internal state to Opening.
+     * Asserts the PT line to start a Minitel session.
+     * Starts an internal transaction to wait for the SEP 5/4 acknowledgment.
+     *
+     * @param timeoutMs  Max time to wait for acknowledgment (0 for no wait).
+     * @return true on success (SEP 5/4 received before timeout).
      */
-    void startSession();
+    bool startSession(uint16_t timeoutMs = 2000);
 
     /**
-     * End a Minitel session:
-     *  - releases PT (if ptPin configured),
-     *  - moves internal state to Closing.
+     * Releases the PT line to end a Minitel session.
      */
     void endSession();
 
     /**
-     * Get current session state.
-     */
-    SessionState sessionState() const { return sessionState_; }
-
-    /**
-     * TP low => terminal powered ON (if wired).
-     *
-     * @return true if terminal seems powered, false otherwise or if no TP pin.
+     * True if the TP (Terminal Powered) line is asserted.
      */
     bool isTerminalOn() const;
 
+    /**
+     * Current state of the Minitel session.
+     */
+    SessionState sessionState() const { return sessionState_; }
+
     // ---------------------------------------------------------------------
-    // Unified event API
+    // Core I/O and Polling
     // ---------------------------------------------------------------------
 
     /**
-     * Check if there is at least one Event waiting in the FIFO.
+     * Polls the serial stream and processes incoming bytes into Events.
+     * This must be called frequently in the main loop (or from blocking calls).
+     */
+    void poll();
+
+    /**
+     * Sends raw bytes directly to the Minitel stream.
+     */
+    void writeRaw(const uint8_t* data, size_t len);
+    void writeRaw(uint8_t c);
+
+    // ---------------------------------------------------------------------
+    // Event Queue Access
+    // ---------------------------------------------------------------------
+
+    /**
+     * Returns true if there is at least one unread event.
      */
     bool eventAvailable() const;
 
     /**
-     * Pop next event from FIFO.
+     * Reads the next event from the FIFO.
      *
-     * @param ev  Output Event.
-     * @return true if an event was available, false otherwise.
+     * @param ev  The Event structure to populate.
+     * @return true if an event was read, false otherwise.
      */
     bool readEvent(Event& ev);
 
     /**
-     * Blocking wait for any event (used internally by readChar/readLine).
+     * Blocks until an Event is available or timeout is reached.
+     * Optimized for 1200 bauds: removed delay(1) calls.
      *
-     * @param ev         Output Event.
-     * @param timeoutMs  Timeout in milliseconds.
-     * @return true if an event was read, false on timeout (ev.type == TIMEOUT).
+     * @param ev  The Event structure to populate.
+     * @param timeoutMs  Max time to wait (0 for infinite wait).
+     * @return true if an event was read, false otherwise (timeout/error).
      */
-    bool waitEvent(Event& ev, uint16_t timeoutMs);
+    bool waitEvent(Event& ev, uint16_t timeoutMs = 0);
 
     // ---------------------------------------------------------------------
-    // Keyboard convenience
-    // ---------------------------------------------------------------------
-
-    /**
-     * Blocking char read from unified stream.
-     * Only returns when a CHAR event is received or timeout expires.
-     *
-     * @param c          Output character.
-     * @param timeoutMs  Timeout in milliseconds.
-     * @return true if a char was read, false on timeout.
-     */
-    bool readChar(char& c, uint16_t timeoutMs);
-
-    /**
-     * High-level text input:
-     *  - reads chars until CR/LF or ENVOI (SEP 4/13) or timeout.
-     *  - stores up to maxLen-1 chars into buf (null-terminated).
-     *
-     * @param buf           Output buffer.
-     * @param maxLen        Buffer size in bytes.
-     * @param timeoutMs     Timeout in milliseconds.
-     * @param stopOnEnvoi   If true, stop on ENVOI (SEP 4/13).
-     * @param echoLocally   If true, echoes chars to the Minitel itself.
-     *
-     * @return true if terminated by CR/LF/ENVOI, false on timeout.
-     */
-    bool readLine(char* buf,
-                  size_t maxLen,
-                  uint16_t timeoutMs,
-                  bool stopOnEnvoi = true,
-                  bool echoLocally = false);
-
-    // ---------------------------------------------------------------------
-    // Screen & text helpers
+    // Keyboard helpers
     // ---------------------------------------------------------------------
 
     /**
-     * Clear full screen (FF).
+     * Blocks until a character is received (or timeout).
+     *
+     * @param timeoutMs  Max time to wait (0 for infinite wait).
+     * @return The received 7-bit character code (0 if timeout).
      */
+    uint8_t readChar(uint16_t timeoutMs = 0);
+
+    /**
+     * Blocks until a full line is received (or timeout).
+     * Stops on CR (Enter), LF, or SEP 4/13 (ENVOI key).
+     * Optimized for 1200 bauds: removed delay(1) calls.
+     *
+     * @param buf          Character buffer to write to.
+     * @param bufSize      Size of the buffer.
+     * @param echo         If true, echoes characters back to screen.
+     * @param stopOnEnvoi  If true, stops when the ENVOI key (SEP 4/13) is pressed.
+     * @param timeoutMs    Max time to wait for the entire line (0 for infinite).
+     * @return true if a full line was read (CR/LF/ENVOI received).
+     */
+    bool readLine(char* buf, size_t bufSize, bool echo = true,
+                  bool stopOnEnvoi = true, uint16_t timeoutMs = 0);
+
+    // ---------------------------------------------------------------------
+    // Screen control and text output (G0 Set)
+    // ---------------------------------------------------------------------
+
     void clearScreen();
-
-    /**
-     * Move cursor to home (RS).
-     */
     void home();
-
-    /**
-     * Position cursor.
-     *
-     * @param row  1–24.
-     * @param col  1–40.
-     */
     void setCursor(uint8_t row, uint8_t col);
 
     /**
-     * Low-level single character output.
+     * Prints a single character in the current character set (G0 or G1).
+     * Automatically switches back to G0 if needed for alphanumeric characters.
      */
     void putChar(char c);
 
-    // --- text printing (C-string) -------------------------------------------
-
+    /**
+     * Prints a string of alphanumeric characters.
+     */
     void print(const char* s);
     void println(const char* s);
-    void println();  ///< Empty line (CR/LF or equivalent)
-
-    // --- numeric printing (Arduino-like) ------------------------------------
-
-    void print(char c);
-    void print(uint8_t v, int base = 10);
-    void print(int v, int base = 10);
-    void print(unsigned int v, int base = 10);
-    void print(long v, int base = 10);
-    void print(unsigned long v, int base = 10);
 
     // ---------------------------------------------------------------------
-    // Semi-graphics (G1)
+    // Semi-Graphics Output (G1 Set)
     // ---------------------------------------------------------------------
 
     /**
-     * Enter semi-graphics (SO -> G1 set).
-     */
-    void beginSemiGraphics();
-
-    /**
-     * Leave semi-graphics (SI -> G0 set).
-     */
-    void endSemiGraphics();
-
-    /**
-     * Output one semi-graphic code (0x40–0x7F range typically).
+     * Prints a single character in the G1 (Semi-Graphics) set.
+     * Optimized: only sends C_SO if G1 is not already active.
      */
     void putSemiGraphic(uint8_t code);
 
     /**
-     * Position cursor and output a semi-graphic code.
+     * Prints a string of semi-graphic codes, optimizing for C_REP sequences.
+     */
+    void printSemiGraphics(const char* s);
+
+    /**
+     * Prints a single semi-graphic character at a specific position.
+     * Optimized to manage G0/G1 switching efficiently.
      */
     void putSemiGraphicAt(uint8_t row, uint8_t col, uint8_t code);
 
-    // ---------------------------------------------------------------------
-    // PRO3 switching helpers
-    // ---------------------------------------------------------------------
-
     /**
-     * Configure keyboard to send only to socket:
-     *  - keyboard -> modem OFF
-     *  - modem    -> screen OFF
-     *  - keyboard -> socket ON
-     *
-     * If useTransaction is true, a transaction is started to wait for the
-     * corresponding SEP acknowledgement, with timeoutMs.
+     * Sends the C_SO code (Shift Out) to switch to the G1 (Semi-Graphics) set.
+     * Only sends the byte if the set is not already G1.
      */
-    void configureKeyboardToSocketOnly(bool useTransaction = false,
-                                       uint16_t timeoutMs = 200);
+    void beginSemiGraphics();
 
     /**
-     * Explicitly enable PRO3 mode (socket keyboard routing).
-     * Typically wraps configureKeyboardToSocketOnly() with sane defaults.
+     * Sends the C_SI code (Shift In) to switch back to the G0 (Alphanumeric) set.
+     * Only sends the byte if the set is not already G0.
+     */
+    void endSemiGraphics();
+
+    // ---------------------------------------------------------------------
+    // PRO3: keyboard/screen switching
+    // ---------------------------------------------------------------------
+
+    /**
+     * Enables PRO3 and sets up the default connection (MODEM TX/RX to SCREEN RX/TX).
+     * PRO3 is required to use the PT/TP lines and to configure keyboard routing.
      */
     void enablePRO3();
 
-    // ---------------------------------------------------------------------
-    // Transaction API
-    // ---------------------------------------------------------------------
-
     /**
-     * Start a transaction that completes when a given SEP row/col is seen.
+     * Configures the Minitel to send keyboard input directly to the socket
+     * (peripheral port), and listen to the socket for screen input.
      *
-     * @param row        Expected SEP row.
-     * @param col        Expected SEP col.
-     * @param timeoutMs  Timeout in milliseconds. If 0: no timeout.
-     * @param onSuccess  Optional callback on success.
-     * @param onTimeout  Optional callback on timeout (if timeoutMs > 0).
-     * @param userData   Opaque user pointer passed to callbacks.
-     *
-     * @return false if a transaction is already active, true otherwise.
+     * This is useful for using the Minitel as a full-duplex terminal device.
      */
-    bool beginTransactionWaitSep(uint8_t row,
-                                 uint8_t col,
-                                 uint16_t timeoutMs,
-                                 void (*onSuccess)(void*) = nullptr,
-                                 void (*onTimeout)(void*) = nullptr,
-                                 void* userData = nullptr);
-
-    /**
-     * Cancel current transaction (if any).
-     */
-    void cancelTransaction();
-
-    /**
-     * Check if a transaction is currently active.
-     */
-    bool transactionActive() const { return tx_.active; }
-
-    /**
-     * Access current transaction (read-only).
-     */
-    const Transaction& currentTransaction() const { return tx_; }
+    void configureKeyboardToSocketOnly(bool useTransaction = false, uint16_t timeoutMs = 500);
 
     // ---------------------------------------------------------------------
-    // C0/C1 & ESC-based writers (public low-level access)
+    // Transaction engine
     // ---------------------------------------------------------------------
-public:
-    /**
-     * Write one raw byte to the underlying stream.
-     * No parsing, no translation.
-     */
-    void writeRaw(uint8_t b);
 
     /**
-     * Write a raw byte buffer to the underlying stream.
-     * No parsing, no translation.
+     * Starts a transaction waiting for a specific SEP sequence (e.g., 5/4).
      */
-    void writeRaw(const uint8_t* data, size_t len);
+    void beginTransactionWaitSep(uint8_t sepRow, uint8_t sepCol, uint16_t timeoutMs);
+
+    /**
+     * Returns true if the last transaction was successful.
+     */
+    bool transactionSuccess() const { return tx_.success; }
 
 private:
-    // ---------------------------------------------------------------------
-    // Internal members
-    // ---------------------------------------------------------------------
+    // --- Hardware and Debug ---
+    Stream* stream_ = nullptr;
+    Stream* debug_  = nullptr;
+    uint8_t ptPin_  = 255;
+    uint8_t tpPin_  = 255;
 
-    Stream* io_    = nullptr;   ///< Main Minitel I/O stream.
-    Stream* debug_ = nullptr;   ///< Optional debug stream.
+    // --- State ---
+    SessionState sessionState_ = SessionState::Closed;
 
-    int ptPin_ = -1;            ///< PT control pin (active LOW). -1 if unused.
-    int tpPin_ = -1;            ///< TP sense pin. -1 if unused.
+    enum class CharSet : uint8_t {
+        G0_ALPHA,       ///< Default (SI, Shift In)
+        G1_GRAPHIC      ///< Semi-graphics (SO, Shift Out)
+    };
+    CharSet currentSet_ = CharSet::G0_ALPHA; ///< Tracks the active character set for output optimization.
 
-    SessionState   sessionState_        = SessionState::Closed;
-    unsigned long  lastSessionEventMs_  = 0;
-
-    // Unified event FIFO
-    static const uint8_t EVENTBUF_SIZE = 32;
+    // --- Event FIFO ---
+    static const uint8_t EVENTBUF_SIZE = 16;
     Event   eventBuf_[EVENTBUF_SIZE];
     uint8_t eventHead_ = 0;     ///< index of next free slot.
     uint8_t eventTail_ = 0;     ///< index of next unread event.
 
-    // SEP and ESC parsing state
+    // --- SEP and ESC parsing state ---
     bool waitingSepSecond_ = false;
 
     enum EscState : uint8_t {
@@ -366,7 +290,7 @@ private:
     uint8_t  escTmp_[4]  = {0};
     uint8_t  escTmpLen_  = 0;
 
-    // Current transaction
+    // --- Current transaction ---
     Transaction tx_;
 
     // ---------------------------------------------------------------------
@@ -375,8 +299,6 @@ private:
 
     /**
      * Drive PT pin (if available).
-     *
-     * @param active  true => PT asserted (session ON), false => released.
      */
     void setPT(bool active);
 
@@ -389,6 +311,15 @@ private:
      * Core byte parser: builds Events from incoming bytes.
      */
     void parseByte(uint8_t c);
+
+    /**
+     * Handles complex C0 controls (HT, VT, DEL, etc.) by consuming the byte
+     * and performing internal line-editing/cursor logic, keeping the Event FIFO clean.
+     *
+     * @param c  The 7-bit control code.
+     * @return true if the byte was handled and consumed (no event generated).
+     */
+    bool handleLineEditingControl(uint8_t c);
 
     /**
      * Handle two-byte SEP sequences.
@@ -406,7 +337,7 @@ private:
     void onSepForTransaction(uint8_t row, uint8_t col);
 
     /**
-     * Check for transaction timeout and call onTimeout if needed.
+     * Prints a string with C_REP (Repeat) optimization for contiguous characters.
      */
-    void checkTransactionTimeout();
+    void printOptimized(const char* s, size_t len);
 };
