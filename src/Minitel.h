@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <Print.h>
 
 /**
  * @file Minitel.h
@@ -9,15 +10,35 @@
  *
  * - Uses a generic Stream (HardwareSerial recommended: 1200 bauds, SERIAL_7E1).
  * - Provides:
- * - Unified event stream (chars, SEP, ESC sequences, controls).
- * - Simple async "transaction" system (C-style callbacks).
- * - Screen helpers: clear, cursor, text, semi-graphics.
- * - Keyboard helpers: readChar, readLine.
+ *   - Unified event stream (chars, SEP, ESC sequences, controls).
+ *   - Simple async "transaction" system (wait for SEP).
+ *   - Screen helpers: clear, cursor, text, semi-graphics.
+ *   - Keyboard helpers: readChar, readLine.
  *
  * Designed for Arduino Mega 2560 + Serial1, but works with any Stream.
  */
-class Minitel {
+class Minitel : public Print {
 public:
+
+    // ---------------------------------------------------------------------
+    // Exposed SEP key codes (per STUM M1, verified from user terminal)
+    // These allow user code (main.cpp) to compare SEP events cleanly.
+    // ---------------------------------------------------------------------
+    static constexpr uint8_t SEP_SEND      = 0x41; // 4/1  ENVOI / SEND
+    static constexpr uint8_t SEP_PREVIOUS  = 0x42; // 4/2  RETOUR
+    static constexpr uint8_t SEP_REPEAT    = 0x43; // 4/3
+    static constexpr uint8_t SEP_GUIDE     = 0x44; // 4/4
+    static constexpr uint8_t SEP_CANCEL    = 0x45; // 4/5  ANNULATION
+    static constexpr uint8_t SEP_INDEX     = 0x46; // 4/6
+    static constexpr uint8_t SEP_ERASE     = 0x47; // 4/7  CORRECTION
+    static constexpr uint8_t SEP_NEXT      = 0x48; // 4/8  SUITE
+    static constexpr uint8_t SEP_CONNECT   = 0x49; // 4/9  CONNECT / DISCONNECT
+
+    // // Aliases for user convenience
+    // static constexpr uint8_t SEP_ENVOI     = SEP_SEND;
+    // static constexpr uint8_t SEP_RETOUR    = SEP_PREVIOUS;
+    // static constexpr uint8_t SEP_ANNUL     = SEP_CANCEL;
+
     // ---------------------------------------------------------------------
     // Event type (unified RX abstraction)
     // ---------------------------------------------------------------------
@@ -30,10 +51,10 @@ public:
             TIMEOUT    ///< Artificial event used by blocking helpers
         } type;
 
-        uint8_t code;     ///< CHAR: character; SEP: second byte; ESCSEQ: opcode (e.g. 0x3B)
-        uint8_t row;      ///< SEP row (for type == SEP)
-        uint8_t col;      ///< SEP col (for type == SEP)
-        uint8_t escLen;   ///< ESCSEQ: length of escData
+        uint8_t code;       ///< CHAR: character; SEP: second byte; ESCSEQ: opcode (e.g. 0x3B)
+        uint8_t row;        ///< SEP row (for type == SEP)
+        uint8_t col;        ///< SEP col (for type == SEP)
+        uint8_t escLen;     ///< ESCSEQ: length of escData
         uint8_t escData[4]; ///< ESCSEQ: sequence payload (max 4 bytes)
     };
 
@@ -73,18 +94,43 @@ public:
      */
     void begin(Stream* stream, uint8_t ptPin = 255, uint8_t tpPin = 255, Stream* debug = nullptr);
 
+    void setDebug(Stream* debug) { debug_ = debug; }
+
+    // ---------------------------------------------------------------------
+    // Print base (Print compatibility)
+    // ---------------------------------------------------------------------
+    virtual size_t write(uint8_t b) override;
+    virtual size_t write(const uint8_t* buffer, size_t size) override;
+
+    // Convenience print overloads (these call into our optimized routines)
+    void print(const char* s);
+    void println(const char* s);
+    void println();
+    void println(uint8_t v, int base = 10);
+    void println(int v, int base = 10);
+    void println(unsigned int v, int base = 10);
+    void println(long v, int base = 10);
+    void println(unsigned long v, int base = 10);
+
+    void print(char c);
+    void print(uint8_t v, int base = 10);
+    void print(int v, int base = 10);
+    void print(unsigned int v, int base = 10);
+    void print(long v, int base = 10);
+    void print(unsigned long v, int base = 10);
+
     // ---------------------------------------------------------------------
     // Session Management (PT/TP)
     // ---------------------------------------------------------------------
 
     /**
      * Asserts the PT line to start a Minitel session.
-     * Starts an internal transaction to wait for the SEP 5/4 acknowledgment.
+     * Optionally waits synchronously for SEP 5/4 acknowledgment.
      *
      * @param timeoutMs  Max time to wait for acknowledgment (0 for no wait).
-     * @return true on success (SEP 5/4 received before timeout).
+     * @return true on success (or if timeoutMs == 0), false if wait failed.
      */
-    bool startSession(uint16_t timeoutMs = 2000);
+    bool startSession(uint16_t timeoutMs = 0);
 
     /**
      * Releases the PT line to end a Minitel session.
@@ -136,7 +182,7 @@ public:
 
     /**
      * Blocks until an Event is available or timeout is reached.
-     * Optimized for 1200 bauds: removed delay(1) calls.
+     * Optimized for 1200 bauds: no delay(1) calls.
      *
      * @param ev  The Event structure to populate.
      * @param timeoutMs  Max time to wait (0 for infinite wait).
@@ -159,7 +205,7 @@ public:
     /**
      * Blocks until a full line is received (or timeout).
      * Stops on CR (Enter), LF, or SEP 4/13 (ENVOI key).
-     * Optimized for 1200 bauds: removed delay(1) calls.
+     * Optimized for 1200 bauds: no delay(1) inside parsing.
      *
      * @param buf          Character buffer to write to.
      * @param bufSize      Size of the buffer.
@@ -179,68 +225,43 @@ public:
     void home();
     void setCursor(uint8_t row, uint8_t col);
 
+/**
+ * Position the cursor on row 00 (status row), at the given column (1–40).
+ * Uses the special US 4/0, X/Y sequence described in STUM.
+ */
+void setCursorRow0(uint8_t col);
+
+/**
+ * Print a full status line on row 00.
+ * - Text is truncated to 40 chars
+ * - The remaining part of the row is filled with spaces
+ * - A LF is sent at the end to leave row 00 and restore previous position
+ */
+void printRow0(const char* s);
+    
     /**
      * Prints a single character in the current character set (G0 or G1).
      * Automatically switches back to G0 if needed for alphanumeric characters.
      */
     void putChar(char c);
 
-    /**
-     * Prints a string of alphanumeric characters.
-     */
-    void print(const char* s);
-    void println(const char* s);
-
     // ---------------------------------------------------------------------
     // Semi-Graphics Output (G1 Set)
     // ---------------------------------------------------------------------
 
-    /**
-     * Prints a single character in the G1 (Semi-Graphics) set.
-     * Optimized: only sends C_SO if G1 is not already active.
-     */
     void putSemiGraphic(uint8_t code);
-
-    /**
-     * Prints a string of semi-graphic codes, optimizing for C_REP sequences.
-     */
     void printSemiGraphics(const char* s);
-
-    /**
-     * Prints a single semi-graphic character at a specific position.
-     * Optimized to manage G0/G1 switching efficiently.
-     */
     void putSemiGraphicAt(uint8_t row, uint8_t col, uint8_t code);
-
-    /**
-     * Sends the C_SO code (Shift Out) to switch to the G1 (Semi-Graphics) set.
-     * Only sends the byte if the set is not already G1.
-     */
     void beginSemiGraphics();
-
-    /**
-     * Sends the C_SI code (Shift In) to switch back to the G0 (Alphanumeric) set.
-     * Only sends the byte if the set is not already G0.
-     */
     void endSemiGraphics();
 
     // ---------------------------------------------------------------------
     // PRO3: keyboard/screen switching
     // ---------------------------------------------------------------------
 
-    /**
-     * Enables PRO3 and sets up the default connection (MODEM TX/RX to SCREEN RX/TX).
-     * PRO3 is required to use the PT/TP lines and to configure keyboard routing.
-     */
     void enablePRO3();
-
-    /**
-     * Configures the Minitel to send keyboard input directly to the socket
-     * (peripheral port), and listen to the socket for screen input.
-     *
-     * This is useful for using the Minitel as a full-duplex terminal device.
-     */
-    void configureKeyboardToSocketOnly(bool useTransaction = false, uint16_t timeoutMs = 500);
+    void configureKeyboardToSocketOnly(bool useTransaction = false,
+                                       uint16_t timeoutMs = 500);
 
     // ---------------------------------------------------------------------
     // Transaction engine
@@ -248,6 +269,7 @@ public:
 
     /**
      * Starts a transaction waiting for a specific SEP sequence (e.g., 5/4).
+     * Non-blocking: result is updated internally when SEP arrives or timeout.
      */
     void beginTransactionWaitSep(uint8_t sepRow, uint8_t sepCol, uint16_t timeoutMs);
 
@@ -255,6 +277,54 @@ public:
      * Returns true if the last transaction was successful.
      */
     bool transactionSuccess() const { return tx_.success; }
+
+        enum class CharSet : uint8_t {
+        G0_ALPHA,   ///< Default (SI, Shift In)
+        G1_GRAPHIC  ///< Semi-graphics (SO, Shift Out)
+    };
+    CharSet currentSet_ = CharSet::G0_ALPHA;
+
+
+
+    // Couleurs 0..7 dans l'ordre du STUM
+enum class Color : uint8_t {
+    Black   = 0,
+    Red     = 1,
+    Green   = 2,
+    Yellow  = 3,
+    Blue    = 4,
+    Magenta = 5,
+    Cyan    = 6,
+    White   = 7
+};
+
+void setCharColor(Color c);    // ESC 4/x
+void setBgColor(Color c);      // ESC 5/x
+
+void setFlash(bool enable);    // ESC 4/8 ou 4/9
+void setLining(bool enable);   // ESC 4/A (start) ou 5/9 (stop field-level)
+void setPolarity(bool negative); // ESC 5/C / 5/D (attention : pas en G1)
+void setSizeNormal();          // ESC 4/C
+void setDoubleHeight(bool on); // ESC 4/D + gestion interne
+void setDoubleWidth(bool on);  // ESC 4/E + gestion interne
+void setDoubleSize(bool on);   // ESC 4/F + gestion interne
+
+// Masquage global (full screen mask behaviour)
+void setMaskReveal(bool reveal); // false => conceal (5/8), true => reveal (5/F)
+
+
+// Screen geometry (default Minitel 1)
+uint8_t rows() const { return 24; }
+uint8_t cols() const { return 40; }
+
+// Fill spaces starting at current cursor
+void fillSpaces(uint8_t count);
+
+// Convenience: position and print 1 char
+void putCharAt(uint8_t row, uint8_t col, char c);
+
+bool requestCursorPosition(uint8_t& outRow, uint8_t& outCol, uint16_t timeoutMs = 300);
+
 
 private:
     // --- Hardware and Debug ---
@@ -264,13 +334,10 @@ private:
     uint8_t tpPin_  = 255;
 
     // --- State ---
-    SessionState sessionState_ = SessionState::Closed;
+    SessionState   sessionState_       = SessionState::Closed;
+    unsigned long lastSessionEventMs_  = 0;
 
-    enum class CharSet : uint8_t {
-        G0_ALPHA,       ///< Default (SI, Shift In)
-        G1_GRAPHIC      ///< Semi-graphics (SO, Shift Out)
-    };
-    CharSet currentSet_ = CharSet::G0_ALPHA; ///< Tracks the active character set for output optimization.
+
 
     // --- Event FIFO ---
     static const uint8_t EVENTBUF_SIZE = 16;
@@ -297,47 +364,14 @@ private:
     // Internal helpers
     // ---------------------------------------------------------------------
 
-    /**
-     * Drive PT pin (if available).
-     */
     void setPT(bool active);
-
-    /**
-     * Push a parsed Event into FIFO (drops event if FIFO full).
-     */
     void pushEvent(const Event& ev);
-
-    /**
-     * Core byte parser: builds Events from incoming bytes.
-     */
     void parseByte(uint8_t c);
-
-    /**
-     * Handles complex C0 controls (HT, VT, DEL, etc.) by consuming the byte
-     * and performing internal line-editing/cursor logic, keeping the Event FIFO clean.
-     *
-     * @param c  The 7-bit control code.
-     * @return true if the byte was handled and consumed (no event generated).
-     */
     bool handleLineEditingControl(uint8_t c);
-
-    /**
-     * Handle two-byte SEP sequences.
-     */
     void handleSep(uint8_t secondByte);
-
-    /**
-     * Handle ESC-prefixed sequences.
-     */
     void handleEscByte(uint8_t c);
-
-    /**
-     * Notify transaction engine that a SEP(row,col) was just received.
-     */
     void onSepForTransaction(uint8_t row, uint8_t col);
+    void checkTransactionTimeout();
 
-    /**
-     * Prints a string with C_REP (Repeat) optimization for contiguous characters.
-     */
     void printOptimized(const char* s, size_t len);
 };
